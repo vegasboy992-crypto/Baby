@@ -1,0 +1,271 @@
+<!DOCTYPE html>
+<html lang="fa" dir="rtl">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>مانیتور نوزاد — نظارت صوتی و لالایی</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; font-family: Tahoma, "Segoe UI", sans-serif; }
+  body { background: #1b2233; color: #eef2f7; min-height: 100vh; display: flex; align-items: center; justify-content: center; padding: 16px; }
+  .app { background: #242d42; border-radius: 18px; padding: 24px; width: 100%; max-width: 720px; box-shadow: 0 10px 40px rgba(0,0,0,.5); }
+  h1 { font-size: 20px; margin-bottom: 4px; color: #ffd479; }
+  .sub { font-size: 12px; color: #9fb0c8; margin-bottom: 18px; }
+  .panel { background: #2e3954; border-radius: 12px; padding: 16px; margin-bottom: 14px; }
+  .panel h2 { font-size: 14px; margin-bottom: 10px; color: #8fd3ff; }
+  button { background: #4f7cff; color: #fff; border: none; border-radius: 8px; padding: 10px 18px; font-size: 14px; cursor: pointer; margin-inline-end: 8px; }
+  button:hover { background: #3b66e0; }
+  button.stop { background: #d9534f; }
+  button.stop:hover { background: #b73e3a; }
+  button:disabled { background: #55617d; cursor: not-allowed; }
+  canvas { width: 100%; height: 120px; background: #1b2233; border-radius: 8px; display: block; }
+  .row { display: flex; align-items: center; gap: 10px; margin-top: 8px; flex-wrap: wrap; }
+  label { font-size: 13px; color: #c9d6e8; }
+  select, input[type=range] { accent-color: #4f7cff; }
+  select { background: #1b2233; color: #eef2f7; border: 1px solid #445; border-radius: 6px; padding: 6px 10px; }
+  .status { display: inline-block; padding: 4px 12px; border-radius: 20px; font-size: 12px; background: #55617d; }
+  .status.on { background: #2e9e5b; }
+  .status.alert { background: #d9534f; animation: blink 1s infinite; }
+  @keyframes blink { 50% { opacity: .4; } }
+  .indicator { font-size: 13px; margin-top: 8px; }
+  .dot { display: inline-block; width: 12px; height: 12px; border-radius: 50%; background: #444; margin-inline-end: 6px; vertical-align: middle; }
+  .dot.cry { background: #ff5252; }
+  .dot.loud { background: #ffc107; }
+  .dot.quiet { background: #4caf50; }
+  .note { font-size: 11px; color: #8296b3; margin-top: 10px; line-height: 1.8; }
+  input[type=range] { width: 140px; }
+</style>
+</head>
+<body>
+<div class="app">
+  <h1>🍼 مانیتور نوزاد</h1>
+  <div class="sub">تحلیل صوتی بلادرنگ با Web Audio API + پخش لالایی رویه‌ای (Procedural)</div>
+
+  <div class="panel">
+    <h2>۱. میکروفون و تحلیل صدا</h2>
+    <button id="btnMic">شروع نظارت صوتی</button>
+    <button id="btnMicStop" class="stop" disabled>توقف</button>
+    <span class="status" id="micStatus">غیرفعال</span>
+    <canvas id="waveCanvas"></canvas>
+    <div class="row">
+      <label>آستانه هشدار گریه: <span id="thrVal">0.25</span></label>
+      <input type="range" id="threshold" min="0.05" max="0.9" step="0.01" value="0.25">
+    </div>
+    <div class="indicator"><span class="dot" id="stateDot"></span><span id="stateText">—</span> | سطح صدا: <b id="level">0</b></div>
+  </div>
+
+  <div class="panel">
+    <h2>۲. لالایی رویه‌ای</h2>
+    <div class="row">
+      <label>ملودی:</label>
+      <select id="melody">
+        <option value="brahms">لالایی برامس</option>
+        <option value="twinkle">ستاره کوچک (Twinkle)</option>
+        <option value="rain">جوغن‌آب / باران آرام</option>
+      </select>
+      <label>سرعت:</label>
+      <input type="range" id="tempo" min="50" max="110" value="76">
+      <span id="tempoVal">۷۶</span>
+      <label>بلندی:</label>
+      <input type="range" id="vol" min="0" max="100" value="45">
+    </div>
+    <div class="row">
+      <button id="btnLull">پخش لالایی</button>
+      <button id="btnLullStop" class="stop" disabled>توقف لالایی</button>
+      <label><input type="checkbox" id="autoLull"> پخش خودکار هنگام گریه</label>
+    </div>
+  </div>
+
+  <div class="note">
+    🔒 همه پردازش‌ها به‌صورت محلی در مرورگر شما انجام می‌شود؛ هیچ صدایی ارسال یا ذخیره نمی‌شود.
+    برای دسترسی به میکروفون باید اجازه مرورگر را تأیید کنید. فایل کاملاً مستقل است (بدون نیاز به اینترنت).
+  </div>
+</div>
+
+<script>
+"use strict";
+// ---------- status helpers ----------
+const $ = id => document.getElementById(id);
+const fa = n => String(n).replace(/\d/g, d => "۰۱۲۳۴۵۶۷۸۹"[d]);
+
+// ---------- 1) MIC MONITOR ----------
+let audioCtx = null, micStream = null, analyser = null, timeData = null, freqData = null;
+let monitoring = false, cryTimer = null, rafId = null;
+
+function setStatus(text, cls) {
+  const s = $("micStatus");
+  s.textContent = text;
+  s.className = "status " + (cls || "");
+}
+
+async function startMic() {
+  try {
+    micStream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: false, noiseSuppression: false } });
+  } catch (e) {
+    setStatus("دسترسی رد شد", "alert");
+    alert("دسترسی به میکروفون ممکن نیست: " + e.message);
+    return;
+  }
+  audioCtx = audioCtx || new (window.AudioContext || window.webkitAudioContext)();
+  await audioCtx.resume();
+  const src = audioCtx.createMediaStreamSource(micStream);
+  analyser = audioCtx.createAnalyser();
+  analyser.fftSize = 2048;
+  analyser.smoothingTimeConstant = 0.75;
+  src.connect(analyser);
+  timeData = new Float32Array(analyser.fftSize);
+  freqData = new Uint8Array(analyser.frequencyBinCount);
+  monitoring = true;
+  $("btnMic").disabled = true; $("btnMicStop").disabled = false;
+  setStatus("در حال نظارت", "on");
+  loop();
+}
+
+function stopMic() {
+  monitoring = false;
+  if (rafId) cancelAnimationFrame(rafId);
+  if (micStream) micStream.getTracks().forEach(t => t.stop());
+  if (cryTimer) { clearTimeout(cryTimer); cryTimer = null; }
+  $("btnMic").disabled = false; $("btnMicStop").disabled = true;
+  setStatus("غیرفعال", "");
+  setState("quiet", "—");
+  $("level").textContent = "۰";
+}
+
+function rms(buf) {
+  let s = 0;
+  for (let i = 0; i < buf.length; i++) s += buf[i] * buf[i];
+  return Math.sqrt(s / buf.length);
+}
+
+// heuristic cry detection: high energy + strong energy in 300–1200 Hz + fast fluctuation
+let history = [];
+function isCry(level, freqData) {
+  // energy fraction between ~300 and ~1200 Hz
+  const binHz = audioCtx.sampleRate / 2 / freqData.length;
+  let lo = Math.floor(300 / binHz), hi = Math.floor(1200 / binHz), band = 0, total = 0;
+  for (let i = 0; i < freqData.length; i++) total += freqData[i];
+  for (let i = lo; i <= hi; i++) band += freqData[i];
+  const bandRatio = total > 0 ? band / total : 0;
+  history.push(level); if (history.length > 20) history.shift();
+  let varSum = 0, mean = history.reduce((a, b) => a + b, 0) / history.length;
+  for (const v of history) varSum += (v - mean) ** 2;
+  const fluct = Math.sqrt(varSum / history.length);
+  return level > parseFloat($("threshold").value) && bandRatio > 0.25 && fluct > 0.01;
+}
+
+function setState(kind, text) {
+  $("stateDot").className = "dot " + kind;
+  $("stateText").textContent = text;
+}
+
+let cryActive = false;
+function loop() {
+  if (!monitoring) return;
+  rafId = requestAnimationFrame(loop);
+  analyser.getFloatTimeDomainData(timeData);
+  analyser.getByteFrequencyData(freqData);
+  const level = rms(timeData);
+  drawWave(timeData);
+  $("level").textContent = fa((level * 100).toFixed(0));
+
+  if (isCry(level, freqData)) {
+    setState("cry", "گریه شنیده شد! 🔴");
+    if ($("autoLull").checked && !isLullPlaying) startLull();
+    if (cryTimer) clearTimeout(cryTimer);
+    cryTimer = setTimeout(() => setState("quiet", "آرام ✅"), 4000);
+  } else if (level > parseFloat($("threshold").value) * 0.6) {
+    setState("loud", "صدای متوسط 🟡");
+  } else {
+    setState("quiet", "آرام ✅");
+  }
+}
+
+// ---------- canvas ----------
+const canvas = $("waveCanvas"), ctx = canvas.getContext("2d");
+function sizeCanvas() { canvas.width = canvas.clientWidth * devicePixelRatio; canvas.height = 120 * devicePixelRatio; }
+window.addEventListener("resize", sizeCanvas); sizeCanvas();
+function drawWave(data) {
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+  ctx.strokeStyle = "#4f7cff"; ctx.lineWidth = 2 * devicePixelRatio;
+  ctx.beginPath();
+  const N = data.length, H = canvas.height;
+  for (let i = 0; i < N; i++) {
+    const x = i / N * canvas.width, y = H / 2 + data[i] * H * 1.6;
+    i ? ctx.lineTo(x, y) : ctx.moveTo(x, y);
+  }
+  ctx.stroke();
+}
+
+// ---------- 2) PROCEDURAL LULLABY ----------
+const SCALES = {
+  brahms: { notes: [76,76,79,76,72,74,71,67,64,67,71,74,72,71,69,67,72,74,76,79,74,71,67,64,72,67,60,64,67,69,71,72,74,76,71,72,79,76,71,72,79,74,72,71,74,72,71,69,67,72,74,76,71,72,79,76,71,72,79,74,72,71,74,72,71,69,67,72,74,76,79,74,71,67,64,72,67,60,64,67,64,60,59,60,72,71,69,67,64,67,71,74,72,71,67], dur: [1,1,1,1,1,1,1,2,1,1,1,2,1,1,1,2,1,1,1,2,1,1,1,2,1,1,1,1,1,1,1,2,1,1,1,2,1,1,1,2,1,1,1,2,1,1,1,2,1,1,1,2,1,1,1,2,1,1,1,2,1,1,1,2,1,1,1,2,1,1,1,2,1,1,1,2,1,1,1,2,1,1,1,2,1,1,1,2,1,1,1,2,1,1,3] },
+  twinkle: { notes: [60,60,67,67,69,69,67,65,65,64,64,62,62,60,67,67,65,65,64,64,62,67,67,65,65,64,64,62,60,60,67,67,69,69,67,65,65,64,64,62,62,60], dur: [1,1,1,1,1,1,2,1,1,1,1,1,1,2,1,1,1,1,1,1,2,1,1,1,1,1,1,2,1,1,1,1,1,1,2,1,1,1,1,1,1,2] },
+  rain: { notes: [72,71,69,67,65,64,62,60,62,64,65,67,69,71,72,71,69,67,69,71,72,74,72,71,69,67,65,64,62,64,65,67,69,71,72,72,74,72,71,69,71,72], dur: [1.5,0.5,1,1,1.5,0.5,1,1,1.5,0.5,1,1,1.5,0.5,2,1.5,0.5,1,1.5,0.5,1,2,1.5,0.5,1,1.5,0.5,1,1.5,0.5,1,1.5,0.5,2,1.5,0.5,1,1.5,0.5,1,1.5,2] }
+};
+let lullOsc = null, lullGain = null, lullTimer = null, isLullPlaying = false;
+
+function noteFreq(midi) { return 440 * Math.pow(2, (midi - 69) / 12); }
+
+function scheduleNote(midi, durSec, vol) {
+  const t = audioCtx.currentTime;
+  const g = audioCtx.createGain();
+  const o = audioCtx.createOscillator();
+  const f = audioCtx.createBiquadFilter();
+  f.type = "lowpass"; f.frequency.value = 2200;
+  o.type = "sine";
+  o.frequency.value = noteFreq(midi);
+  g.gain.setValueAtTime(0, t);
+  g.gain.linearRampToValueAtTime(vol, t + 0.05);
+  g.gain.exponentialRampToValueAtTime(0.001, t + durSec * 1.05);
+  o.connect(f); f.connect(g); g.connect(audioCtx.destination);
+  o.start(t); o.stop(t + durSec * 1.1);
+  // soft harmonic overtone
+  const o2 = audioCtx.createOscillator(), g2 = audioCtx.createGain();
+  o2.type = "triangle"; o2.frequency.value = noteFreq(midi) * 2;
+  g2.gain.setValueAtTime(0, t);
+  g2.gain.linearRampToValueAtTime(vol * 0.12, t + 0.08);
+  g2.gain.exponentialRampToValueAtTime(0.001, t + durSec);
+  o2.connect(g2); g2.connect(audioCtx.destination);
+  o2.start(t); o2.stop(t + durSec * 1.1);
+}
+
+function startLull() {
+  if (isLullPlaying) return;
+  audioCtx = audioCtx || new (window.AudioContext || window.webkitAudioContext)();
+  audioCtx.resume();
+  isLullPlaying = true;
+  $("btnLull").disabled = true; $("btnLullStop").disabled = false;
+  playSequence();
+}
+
+function playSequence() {
+  if (!isLullPlaying) return;
+  const sel = SCALES[$("melody").value];
+  const tempo = parseFloat($("tempo").value); // BPM
+  const vol = parseFloat($("vol").value) / 100 * 0.35;
+  const beat = 60 / tempo;
+  let t = 0.1;
+  for (let i = 0; i < sel.notes.length; i++) {
+    const d = sel.dur[i] * beat;
+    setTimeout(() => { if (isLullPlaying) scheduleNote(sel.notes[i], d, vol); }, t * 1000);
+    t += d;
+  }
+  lullTimer = setTimeout(playSequence, t * 1000 + 800); // loop with small pause
+}
+
+function stopLull() {
+  isLullPlaying = false;
+  clearTimeout(lullTimer);
+  $("btnLull").disabled = false; $("btnLullStop").disabled = true;
+}
+
+// ---------- events ----------
+$("btnMic").onclick = startMic;
+$("btnMicStop").onclick = stopMic;
+$("btnLull").onclick = startLull;
+$("btnLullStop").onclick = stopLull;
+$("threshold").oninput = e => $("thrVal").textContent = fa(parseFloat(e.target.value).toFixed(2));
+$("tempo").oninput = e => $("tempoVal").textContent = fa(e.target.value);
+</script>
+</body>
+</html>
